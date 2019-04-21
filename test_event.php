@@ -8,12 +8,14 @@ class Http {
 	private $host;
 	private $uri;
 
+
 	private $chunkSize = 1024;
 
 	private $buffer = "";
 	private $header = "";
 	private $body = "";
 	private $contentLength = -1;
+	private $transferEncoding;
 
 	private $downloadTo;
 	private $sendBuffer;
@@ -35,7 +37,36 @@ class Http {
 		$this->host = $host;
 		$this->uri = $uri;
 
-		$this->stream = stream_socket_client("tcp://{$host}:{$port}");
+		$context = null;
+
+		if ($parse['scheme'] == 'https') {
+			$protocol = 'tls';
+			$defaultPort = 443;
+
+			$context = stream_context_create([
+				'ssl' => [
+					'verify_peer' => false,
+					'verify_peer_name' => false,
+				]
+			]);
+		} else {
+			$protocol = 'tcp';
+			$defaultPort = 80;
+
+			$context = stream_context_create();
+		}
+
+		$port = $parse['port'] ?? $defaultPort;
+
+		$this->stream = stream_socket_client(
+			"{$protocol}://{$host}:{$port}",
+			$errorno,
+			$errorstr,
+			30,
+			STREAM_CLIENT_ASYNC_CONNECT,
+			$context
+		);
+		
 		stream_set_blocking($this->stream, 0);
 		stream_set_write_buffer($this->stream, 0);
 		stream_set_read_buffer($this->stream, 0);
@@ -52,6 +83,7 @@ class Http {
 			"GET {$this->uri} HTTP/1.1",
 			"Host: {$this->host}",
 			"Connection: keep-alive",
+			"Accept-Encoding: deflate",
 		];
 
 		$header = implode("\r\n", $http);
@@ -112,6 +144,33 @@ class Http {
 		}
 	}
 
+	function decodeChunks()
+	{
+		$body = "";
+
+		$pos = strlen($this->header);
+		while ($pos < strlen($this->buffer) && ($lineEnd = strpos($this->buffer, "\r\n", $pos)) !== false) {
+			$data = substr($this->buffer, $pos, $lineEnd - $pos);
+
+			$chunkSize = intval($data, 16);
+
+			if ($chunkSize == 0) {
+				return $body;
+			}
+
+			$pos = $lineEnd;
+			$pos += 2;				// \r\n after the chunk size
+
+
+			$body .= substr($this->buffer, $pos, $chunkSize);
+
+			$pos += $chunkSize;		// the chunk
+			$pos += 2;				// \r\n after the chunk
+		}
+
+		return false;
+	}
+
 	function onData($fd) {
 		$this->readAll();
 
@@ -120,9 +179,12 @@ class Http {
 				$this->header = substr($this->buffer, 0, $pos + 4);
 				echo $this->header, "\n";
 
-				$pattern = "#Content-Length: (\d+)#";
-				if (preg_match($pattern, $this->header, $match)) {
+				$contentLengthPattern = "#Content-Length: (\d+)#";
+				$transferEncodingPattern = "#Transfer-Encoding: (.*)\r\n#";
+				if (preg_match($contentLengthPattern, $this->header, $match)) {
 					$this->contentLength = intval($match[1]);
+				} else if (preg_match($transferEncodingPattern, $this->header, $match)) {
+					$this->transferEncoding = trim($match[1]);
 				}
 			}
 		}
@@ -131,6 +193,14 @@ class Http {
 			$this->body = substr($this->buffer, strlen($this->header));
 			$this->onFinish();
 			return false;
+		}
+
+		if ($this->transferEncoding == 'chunked') {
+			if (false !== ($body = $this->decodeChunks())) {
+				$this->body = $body;
+				$this->onFinish();
+				return false;
+			}
 		}
 
 		return true;
@@ -143,7 +213,12 @@ class Http {
 	}
 }
 
-new Http("http://d.hiphotos.baidu.com/image/pic/item/0b7b02087bf40ad1719cf19f592c11dfa9ecce55.jpg", "1.jpg");
+new Http("https://www.php.net/manual/zh/function.stream-socket-shutdown.php", "function.stream-socket-shutdown.html");
+new Http("https://www.php.net/manual/zh/function.stream-context-create.php", "function.stream-context-create.html");
+new Http("https://www.php.net/manual/zh/context.php", "context.html");
+new Http("https://www.php.net/manual/zh/context.ssl.php", "context.ssl.html");
+new Http("https://github.com/", "github.html");
+
 new Http("http://www.zeroplace.cn/", "1.html");
 
 
