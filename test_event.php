@@ -1,6 +1,23 @@
 <?php
 
-$base = new EventBase();
+class EventLoop {
+	private static $eventBase;
+
+	public static function loop() {
+		if (static::$eventBase) {
+			static::$eventBase->loop();
+		}
+	}
+
+	public static function getEventBase()
+	{
+		if (!static::$eventBase) {
+			static::$eventBase = new EventBase();
+		}
+		return static::$eventBase;
+	}
+}
+
 
 class Http {
 	private $url;
@@ -8,9 +25,7 @@ class Http {
 	private $host;
 	private $uri;
 
-
 	private $chunkSize = 1024;
-
 	private $buffer = "";
 	private $header = "";
 	private $body = "";
@@ -22,7 +37,6 @@ class Http {
 	private $sendPos = 0;
 
 	public function __construct($url, $downloadTo) {
-		global $base;
 		$this->url = $url;
 		$this->downloadTo = $downloadTo;
 
@@ -37,44 +51,62 @@ class Http {
 		$this->host = $host;
 		$this->uri = $uri;
 
-		$context = null;
-
 		if ($parse['scheme'] == 'https') {
-			$protocol = 'tls';
 			$defaultPort = 443;
-
-			$context = stream_context_create([
-				'ssl' => [
-					'verify_peer' => false,
-					'verify_peer_name' => false,
-				]
-			]);
 		} else {
-			$protocol = 'tcp';
 			$defaultPort = 80;
-
-			$context = stream_context_create();
 		}
 
 		$port = $parse['port'] ?? $defaultPort;
+		$this->port = $port;
 
-		$this->stream = stream_socket_client(
-			"{$protocol}://{$host}:{$port}",
-			$errorno,
-			$errorstr,
-			30,
-			STREAM_CLIENT_ASYNC_CONNECT,
-			$context
-		);
-		
-		stream_set_blocking($this->stream, 0);
-		stream_set_write_buffer($this->stream, 0);
-		stream_set_read_buffer($this->stream, 0);
+		$this->dns = new EventDnsBase(EventLoop::getEventBase(), true);
+
+		if ($parse['scheme'] == 'https') {
+			$this->initConnectionTLS();
+		} else {
+			$this->initConnection();
+		}
+
+		$this->event->setCallbacks([$this, 'onData'], [$this, 'onWrite'], [$this, 'onEvent']);
+		$this->event->enable(Event::READ | Event::WRITE);
+		$this->event->connectHost($this->dns, $this->host, $this->port);
 
 		$this->sendRequest();
+	}
 
-		$this->event = new Event($base, $this->stream, Event::READ | Event::WRITE, [$this, 'callback']);
-		$this->event->add();
+	private function initConnectionTLS()
+	{
+		$context = new EventSslContext(
+			EventSslContext::TLS_CLIENT_METHOD, [
+				EventSslContext::OPT_VERIFY_PEER => 0,
+				EventSslContext::OPT_VERIFY_DEPTH => 0
+			]
+		);
+
+		$this->event = EventBufferEvent::sslSocket(EventLoop::getEventBase(), null, $context, EventBufferEvent::SSL_CONNECTING);
+
+	}
+
+	private function initConnection()
+	{
+		$this->event = new EventBufferEvent(EventLoop::getEventBase());
+	}
+
+	public function onEvent($bev, $event)
+	{
+		if ($event & EventBufferEvent::ERROR) {
+			echo "Dns Error:" . $bev->getDnsErrorString();
+			echo "\n";
+			echo "Ssl Error:" . $bev->sslError();
+			echo "\n";
+			$this->onFinish();
+		}
+	}
+
+	public function onWrite()
+	{
+		$this->write();
 	}
 
 	private function sendRequest()
@@ -89,31 +121,19 @@ class Http {
 		$header = implode("\r\n", $http);
 		$this->sendBuffer = $header . "\r\n\r\n";
 		$this->sendPos = 0;
+
+		$this->write();
 	}
 
-	public function callback($fd, $mask)
+	private function write()
 	{
-		global $base;
-
-		$flag = Event::READ;
-
-		if (($mask & Event::READ) != 0) {
-			if (!$this->onData($fd)) {
-				$flag &= ~Event::READ;
+		while ($this->sendPos < strlen($this->sendBuffer)) {
+			$data = substr($this->sendBuffer, $this->sendPos, $this->chunkSize);
+			if (!$this->event->getOutput()->add($data)) {
+				printf("write failed\n");
+				return ;
 			}
-		}
-
-		if (($mask & Event::WRITE) != 0) {
-			$this->onSend($fd);
-		}
-
-		if (strlen($this->sendBuffer) > $this->sendPos) {
-			$flag |= Event::WRITE;
-		}
-
-		if ($flag) {
-			$this->event->set($base, $this->stream, $flag, [$this, 'callback']);
-			$this->event->add();
+			$this->sendPos += strlen($data);
 		}
 	}
 
@@ -136,10 +156,10 @@ class Http {
 
 	private function readAll()
 	{
-		$data = fread($this->stream, $this->chunkSize);
+		$data = $this->event->getInput()->read($this->chunkSize);
 		$this->appendBuffer($data);
 		while (strlen($data) == $this->chunkSize) {
-			$data = fread($this->stream, $this->chunkSize);
+			$data = $this->event->getInput()->read($this->chunkSize);
 			$this->appendBuffer($data);
 		}
 	}
@@ -171,7 +191,7 @@ class Http {
 		return false;
 	}
 
-	function onData($fd) {
+	function onData() {
 		$this->readAll();
 
 		if (empty($this->header)) {
@@ -208,8 +228,14 @@ class Http {
 
 	function onFinish()
 	{
+		echo "request: {$this->url} completed\n";
+
+		$this->event->disable(Event::READ | Event::WRITE);
+		$this->event->free();
+		unset($this->event);
+		unset($this->dns);
+
 		file_put_contents($this->downloadTo, $this->body);
-		stream_socket_shutdown($this->stream, STREAM_SHUT_WR);
 	}
 }
 
@@ -217,10 +243,8 @@ new Http("https://www.php.net/manual/zh/function.stream-socket-shutdown.php", "f
 new Http("https://www.php.net/manual/zh/function.stream-context-create.php", "function.stream-context-create.html");
 new Http("https://www.php.net/manual/zh/context.php", "context.html");
 new Http("https://www.php.net/manual/zh/context.ssl.php", "context.ssl.html");
-new Http("https://github.com/", "github.html");
+// new Http("https://github.com/", "github.html");
+new Http("https://www.google.com/", "1.html");
+new Http("http://www.zeroplace.cn/", "2.html");
 
-new Http("http://www.zeroplace.cn/", "1.html");
-
-
-$base->loop();
-
+EventLoop::loop();
