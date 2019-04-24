@@ -68,9 +68,13 @@ class Http {
 			$this->initConnection();
 		}
 
+		$this->event->setTimeouts(5, 5);
 		$this->event->setCallbacks([$this, 'onData'], [$this, 'onWrite'], [$this, 'onEvent']);
 		$this->event->enable(Event::READ | Event::WRITE);
-		$this->event->connectHost($this->dns, $this->host, $this->port);
+		if (!$this->event->connectHost($this->dns, $this->host, $this->port)) {
+			echo "Connection failed: " . $this->host;
+			return ;
+		}
 
 		$this->sendRequest();
 	}
@@ -79,12 +83,15 @@ class Http {
 	{
 		$context = new EventSslContext(
 			EventSslContext::TLS_CLIENT_METHOD, [
-				EventSslContext::OPT_VERIFY_PEER => 0,
-				EventSslContext::OPT_VERIFY_DEPTH => 0
+				EventSslContext::OPT_CA_FILE => __DIR__ . '/cacert.pem',
+				EventSslContext::OPT_VERIFY_PEER => true,
+				EventSslContext::OPT_ALLOW_SELF_SIGNED => false,
 			]
 		);
 
-		$this->event = EventBufferEvent::sslSocket(EventLoop::getEventBase(), null, $context, EventBufferEvent::SSL_CONNECTING);
+		$this->event = EventBufferEvent::sslSocket(
+			EventLoop::getEventBase(), null, $context, EventBufferEvent::SSL_CONNECTING
+		);
 
 	}
 
@@ -101,7 +108,26 @@ class Http {
 			echo "Ssl Error:" . $bev->sslError();
 			echo "\n";
 			$this->onFinish();
+			return ;
 		}
+
+		if ($event & EventBufferEvent::TIMEOUT) {
+			echo "Timeout\n";
+			$this->onFinish();
+			return ;
+		}
+
+		if ($event & EventBufferEvent::CONNECTED) {
+			echo "Connected\n";
+			printf("sslGetCipherName: %s\n", $this->event->sslGetCipherName());
+			printf("sslGetCipherInfo: %s\n", $this->event->sslGetCipherInfo());
+			printf("sslGetCipherVersion: %s\n", $this->event->sslGetCipherVersion());
+
+			return ;
+		}
+
+		printf("onEvent: %d\n", $event);
+		return ;
 	}
 
 	public function onWrite()
@@ -230,6 +256,7 @@ class Http {
 	{
 		echo "request: {$this->url} completed\n";
 
+
 		$this->event->disable(Event::READ | Event::WRITE);
 		$this->event->free();
 		unset($this->event);
@@ -244,7 +271,7 @@ new Http("https://www.php.net/manual/zh/function.stream-context-create.php", "fu
 new Http("https://www.php.net/manual/zh/context.php", "context.html");
 new Http("https://www.php.net/manual/zh/context.ssl.php", "context.ssl.html");
 // new Http("https://github.com/", "github.html");
-new Http("https://www.google.com/", "1.html");
-new Http("http://www.zeroplace.cn/", "2.html");
+// new Http("https://www.google.com/", "1.html");
+new Http("https://www.baidu.com/", "2.html");
 
 EventLoop::loop();
